@@ -3,22 +3,39 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
 const allowed = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({ origin(origin, cb) { if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true); return cb(new Error('Origin not allowed by CORS')); } }));
+app.use(cors({ origin(origin, cb) {
+  if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
+  return cb(new Error('Origin not allowed by CORS'));
+} }));
 const PORT = Number(process.env.PORT || 4242);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const PRICE_PAISE = 200000;
-const orders = new Map(); // Demo/test mode only. Use a persistent database in production.
+if (!process.env.MONGODB_URI) console.warn('WARNING: MONGODB_URI is missing. Persistent payment storage is required.');
+const mongoClient = new MongoClient(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017', { serverSelectionTimeoutMS: 10000 });
+let orders;
 let razorpay;
 function gateway() {
-  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_KEY_ID.includes('replace_me')) throw new Error('Set Razorpay TEST credentials in payment-backend/.env first.');
+  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_KEY_ID.includes('replace_me')) throw new Error('Set Razorpay TEST credentials in Render Environment Variables.');
   if (!razorpay) razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
   return razorpay;
 }
-app.get('/health', (_req, res) => res.json({ ok: true, mode: 'test-setup', pricePaise: PRICE_PAISE }));
+async function initDb() {
+  await mongoClient.connect();
+  const db = mongoClient.db(process.env.MONGODB_DB || 'autofill_payments');
+  orders = db.collection('profile_payment_orders');
+  await orders.createIndex({ order_id: 1 }, { unique: true });
+  await orders.createIndex({ payment_id: 1 }, { unique: true, sparse: true });
+  await orders.createIndex({ status: 1, created_at: -1 });
+}
+app.get('/health', async (_req, res) => {
+  try { await orders.findOne({}, { projection: { _id: 1 } }); res.json({ ok: true, database: 'connected', databaseType: 'MongoDB', mode: 'test-setup', pricePaise: PRICE_PAISE }); }
+  catch (_e) { res.status(503).json({ ok: false, database: 'disconnected', databaseType: 'MongoDB' }); }
+});
 app.post('/api/create-order', async (req, res) => {
   try {
     const name = String(req.body?.profileName || '').trim().slice(0, 80);
@@ -26,36 +43,63 @@ app.post('/api/create-order', async (req, res) => {
     if (!name) return res.status(400).json({ error: 'Profile name is required.' });
     if (amount !== PRICE_PAISE) return res.status(400).json({ error: 'Profile price must be ₹2,000.' });
     const rp = gateway();
-    const order = await rp.orders.create({ amount: PRICE_PAISE, currency: 'INR', receipt: `profile_${Date.now()}`.slice(0, 40), notes: { purpose: 'new-profile', profileName: name } });
-    orders.set(order.id, { orderId: order.id, amount: PRICE_PAISE, status: 'created', createdAt: Date.now(), profileName: name });
+    const order = await rp.orders.create({ amount: PRICE_PAISE, currency: 'INR', receipt: `profile_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`, notes: { purpose: 'new-profile', profileName: name } });
+    await orders.insertOne({ order_id: order.id, profile_name: name, amount_paise: PRICE_PAISE, currency: 'INR', status: 'created', created_at: new Date(), paid_at: null });
     const checkoutUrl = `/checkout/${encodeURIComponent(order.id)}`;
     res.json({ orderId: order.id, checkoutUrl: `${PUBLIC_BASE_URL}${checkoutUrl}`, keyId: process.env.RAZORPAY_KEY_ID });
-  } catch (e) { res.status(500).json({ error: e.message || 'Could not create order.' }); }
+  } catch (e) { console.error('create-order failed:', e.message); res.status(500).json({ error: 'Could not create payment order. Check backend logs and configuration.' }); }
 });
-app.get('/checkout/:orderId', (req, res) => {
-  const record = orders.get(req.params.orderId);
-  if (!record) return res.status(404).send('Order not found. Create a new payment attempt from the extension.');
-  let keyId;
-  try { gateway(); keyId = process.env.RAZORPAY_KEY_ID; } catch (e) { return res.status(500).send(e.message); }
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay ₹2,000</title><style>body{font:16px system-ui;background:#f4f7fb;color:#152238;display:grid;place-items:center;min-height:95vh;margin:0}.card{background:white;padding:28px;border-radius:16px;box-shadow:0 8px 30px #172b4d18;max-width:420px;width:calc(100% - 64px)}button{background:#087f5b;color:white;border:0;border-radius:8px;padding:12px 18px;font-weight:700;cursor:pointer;width:100%}.muted{color:#64748b;font-size:13px}</style></head><body><main class="card"><h1>Unlock new profile</h1><p>One-time profile fee</p><h2>₹2,000</h2><p class="muted">Razorpay TEST MODE. Use test payment credentials/cards only; no real money should be charged in test mode.</p><button id="pay">Continue to payment</button><p id="status" role="status"></p></main><script src="https://checkout.razorpay.com/v1/checkout.js"></script><script>
-const options={key:${JSON.stringify(keyId)},amount:${record.amount},currency:'INR',name:'Multi-Dataset Autofill',description:'One new profile',order_id:${JSON.stringify(record.orderId)},handler:async function(r){document.getElementById('status').textContent='Verifying payment…';try{const res=await fetch('/api/verify-payment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_id:r.razorpay_order_id,payment_id:r.razorpay_payment_id,signature:r.razorpay_signature})});const data=await res.json();document.getElementById('status').textContent=res.ok?'Payment verified. Return to Chrome and reopen the extension to activate the profile.':(data.error||'Verification failed.');}catch(e){document.getElementById('status').textContent='Could not verify payment. Keep this page open and contact support.'}},modal:{ondismiss:function(){document.getElementById('status').textContent='Checkout closed. No profile is activated until payment is verified.'}}};
+app.get('/checkout/:orderId', async (req, res) => {
+  try {
+    const record = await orders.findOne({ order_id: String(req.params.orderId) }, { projection: { order_id: 1, profile_name: 1, amount_paise: 1, status: 1 } });
+    if (!record) return res.status(404).send('Order not found. Create a new payment attempt from the extension.');
+    if (record.status === 'paid') return res.type('html').send('<!doctype html><meta charset="utf-8"><h2>Payment already verified</h2><p>Return to Chrome and reopen the extension.</p>');
+    let keyId;
+    try { gateway(); keyId = process.env.RAZORPAY_KEY_ID; } catch (e) { return res.status(500).send(e.message); }
+    res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay ₹2,000</title><style>body{font:16px system-ui;background:#f4f7fb;color:#152238;display:grid;place-items:center;min-height:95vh;margin:0}.card{background:white;padding:28px;border-radius:16px;box-shadow:0 8px 30px #172b4d18;max-width:420px;width:calc(100% - 64px)}button{background:#087f5b;color:white;border:0;border-radius:8px;padding:12px 18px;font-weight:700;cursor:pointer;width:100%}.muted{color:#64748b;font-size:13px}</style></head><body><main class="card"><h1>Unlock new profile</h1><p>One-time profile fee</p><h2>₹2,000</h2><p class="muted">Razorpay TEST MODE. Use test payment credentials/cards only; no real money should be charged in test mode.</p><button id="pay">Continue to payment</button><p id="status" role="status"></p></main><script src="https://checkout.razorpay.com/v1/checkout.js"></script><script>
+const options={key:${JSON.stringify(keyId)},amount:${record.amount_paise},currency:'INR',name:'Multi-Dataset Autofill',description:'One new profile',order_id:${JSON.stringify(record.order_id)},handler:async function(r){document.getElementById('status').textContent='Verifying payment…';try{const res=await fetch('/api/verify-payment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_id:r.razorpay_order_id,payment_id:r.razorpay_payment_id,signature:r.razorpay_signature})});const data=await res.json();document.getElementById('status').textContent=res.ok?'Payment verified. Return to Chrome and reopen the extension to activate the profile.':(data.error||'Verification failed.');}catch(e){document.getElementById('status').textContent='Could not verify payment. Keep this page open and contact support.'}},modal:{ondismiss:function(){document.getElementById('status').textContent='Checkout closed. No profile is activated until payment is verified.'}}};
 document.getElementById('pay').onclick=()=>new Razorpay(options).open();</script></body></html>`);
+  } catch (e) { console.error('checkout failed:', e.message); res.status(500).send('Could not load checkout. Please retry.'); }
 });
-app.post('/api/verify-payment', (req, res) => {
+app.post('/api/verify-payment', async (req, res) => {
   try {
     const { order_id, payment_id, signature } = req.body || {};
-    const record = orders.get(String(order_id || ''));
-    if (!record) return res.status(404).json({ error: 'Order not found or server restarted. Please retry payment.' });
-    const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${order_id}|${payment_id}`).digest('hex');
-    const a = Buffer.from(String(signature || '')); const b = Buffer.from(expected);
+    if (!order_id || !payment_id || !signature) return res.status(400).json({ error: 'Missing payment verification fields.' });
+    const orderId = String(order_id), paymentId = String(payment_id), sig = String(signature);
+    const record = await orders.findOne({ order_id: orderId });
+    if (!record) return res.status(404).json({ error: 'Order not found. Please contact support before paying again.' });
+    if (record.status === 'paid' && record.payment_id === paymentId) return res.json({ ok: true, status: 'paid', orderId });
+    const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
+    const a = Buffer.from(sig), b = Buffer.from(expected);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(400).json({ error: 'Payment signature verification failed.' });
-    record.status = 'paid'; record.paymentId = String(payment_id); record.paidAt = Date.now();
-    res.json({ ok: true, status: 'paid' });
-  } catch (e) { res.status(500).json({ error: 'Verification error.' }); }
+    const rpPayment = await gateway().payments.fetch(paymentId);
+    if (rpPayment.order_id !== orderId || Number(rpPayment.amount) !== Number(record.amount_paise) || rpPayment.currency !== 'INR' || !['authorized','captured'].includes(rpPayment.status)) {
+      return res.status(400).json({ error: 'Razorpay payment details do not match this order or payment is not authorized.' });
+    }
+    // Atomic update prevents two concurrent callbacks from activating different payments for the same order.
+    const updated = await orders.updateOne(
+      { order_id: orderId, status: { $ne: 'paid' } },
+      { $set: { status: 'paid', payment_id: paymentId, paid_at: new Date() } }
+    );
+    if (updated.modifiedCount === 0) {
+      const latest = await orders.findOne({ order_id: orderId });
+      if (latest?.status === 'paid' && latest.payment_id === paymentId) return res.json({ ok: true, status: 'paid', orderId });
+      return res.status(409).json({ error: 'This order was already paid with a different payment. Contact support.' });
+    }
+    res.json({ ok: true, status: 'paid', orderId });
+  } catch (e) {
+    console.error('verify-payment failed:', e.message);
+    res.status(500).json({ error: 'Payment verification could not complete. Do not pay again; retry verification or contact support.' });
+  }
 });
-app.get('/api/payment-status/:orderId', (req, res) => {
-  const record = orders.get(req.params.orderId);
-  if (!record) return res.status(404).json({ status: 'unknown', error: 'Order not found. Test backend stores orders in memory.' });
-  res.json({ orderId: record.orderId, status: record.status });
+app.get('/api/payment-status/:orderId', async (req, res) => {
+  try {
+    const record = await orders.findOne({ order_id: String(req.params.orderId) }, { projection: { order_id: 1, status: 1 } });
+    if (!record) return res.status(404).json({ status: 'unknown', error: 'Order not found in persistent database.' });
+    res.json({ orderId: record.order_id, status: record.status });
+  } catch (e) { console.error('payment-status failed:', e.message); res.status(500).json({ error: 'Could not check payment status.' }); }
 });
-app.listen(PORT, () => console.log(`Payment backend listening at http://localhost:${PORT} (Razorpay test credentials required)`));
+(async () => {
+  try { await initDb(); app.listen(PORT, () => console.log(`Payment backend listening on port ${PORT}; persistent MongoDB connected.`)); }
+  catch (e) { console.error('Database initialization failed:', e.message); process.exit(1); }
+})();
