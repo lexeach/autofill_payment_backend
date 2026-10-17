@@ -36,6 +36,7 @@ async function initDb() {
   profiles = db.collection('profiles');
   await users.createIndex({ email: 1 }, { unique: true });
   await profiles.createIndex({ user_id: 1, created_at: -1 });
+  await profiles.createIndex({ source_order_id: 1 }, { unique: true, sparse: true });
   await orders.createIndex({ order_id: 1 }, { unique: true });
   await orders.createIndex({ payment_id: 1 }, { unique: true, sparse: true });
   await orders.createIndex({ status: 1, created_at: -1 });
@@ -79,6 +80,8 @@ app.get('/api/profiles', authRequired, async (req, res) => {
   catch (e) { console.error('list profiles failed:', e.message); res.status(500).json({ error: 'Could not load profiles.' }); }
 });
 app.post('/api/profiles', authRequired, async (req, res) => {
+  // New profiles must be created only by the verified-payment flow below.
+  return res.status(402).json({ error: 'Payment required. Start checkout to create a new profile.', code: 'PAYMENT_REQUIRED' });
   try {
     const name = String(req.body?.name || '').trim().slice(0, 80);
     const fields = req.body?.fields;
@@ -109,15 +112,20 @@ app.get('/health', async (_req, res) => {
   try { await orders.findOne({}, { projection: { _id: 1 } }); res.json({ ok: true, database: 'connected', databaseType: 'MongoDB', mode: 'test-setup', pricePaise: PRICE_PAISE }); }
   catch (_e) { res.status(503).json({ ok: false, database: 'disconnected', databaseType: 'MongoDB' }); }
 });
-app.post('/api/create-order', async (req, res) => {
+app.post('/api/create-order', authRequired, async (req, res) => {
   try {
-    const name = String(req.body?.profileName || '').trim().slice(0, 80);
+    const name = String(req.body?.profileName || req.body?.name || '').trim().slice(0, 80);
+    const fields = req.body?.fields;
     const amount = Number(req.body?.amount);
     if (!name) return res.status(400).json({ error: 'Profile name is required.' });
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return res.status(400).json({ error: 'Profile fields are required.' });
+    if (JSON.stringify(fields).length > 20000) return res.status(413).json({ error: 'Profile data is too large.' });
     if (amount !== PRICE_PAISE) return res.status(400).json({ error: 'Profile price must be ₹2,000.' });
+    const count = await profiles.countDocuments({ user_id: req.auth.sub });
+    if (count >= 100) return res.status(403).json({ error: 'Profile limit reached. Contact support.' });
     const rp = gateway();
-    const order = await rp.orders.create({ amount: PRICE_PAISE, currency: 'INR', receipt: `profile_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`, notes: { purpose: 'new-profile', profileName: name } });
-    await orders.insertOne({ order_id: order.id, profile_name: name, amount_paise: PRICE_PAISE, currency: 'INR', status: 'created', created_at: new Date(), paid_at: null });
+    const order = await rp.orders.create({ amount: PRICE_PAISE, currency: 'INR', receipt: `profile_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`, notes: { purpose: 'new-profile', profileName: name, userId: req.auth.sub } });
+    await orders.insertOne({ order_id: order.id, user_id: req.auth.sub, profile_name: name, profile_fields: fields, amount_paise: PRICE_PAISE, currency: 'INR', status: 'created', created_at: new Date(), paid_at: null, profile_id: null });
     const checkoutUrl = `/checkout/${encodeURIComponent(order.id)}`;
     res.json({ orderId: order.id, checkoutUrl: `${PUBLIC_BASE_URL}${checkoutUrl}`, keyId: process.env.RAZORPAY_KEY_ID });
   } catch (e) { console.error('create-order failed:', e.message); res.status(500).json({ error: 'Could not create payment order. Check backend logs and configuration.' }); }
@@ -141,12 +149,13 @@ app.post('/api/verify-payment', async (req, res) => {
     const orderId = String(order_id), paymentId = String(payment_id), sig = String(signature);
     const record = await orders.findOne({ order_id: orderId });
     if (!record) return res.status(404).json({ error: 'Order not found. Please contact support before paying again.' });
-    if (record.status === 'paid' && record.payment_id === paymentId) return res.json({ ok: true, status: 'paid', orderId });
+    if (!record.user_id || !record.profile_name || !record.profile_fields) return res.status(409).json({ error: 'This legacy order is not linked to a profile account. Contact support before retrying.' });
+    if (record.status === 'paid' && record.payment_id !== paymentId) return res.status(409).json({ error: 'This order was already paid with a different payment. Contact support.' });
     const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
     const a = Buffer.from(sig), b = Buffer.from(expected);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(400).json({ error: 'Payment signature verification failed.' });
     const rpPayment = await gateway().payments.fetch(paymentId);
-    if (rpPayment.order_id !== orderId || Number(rpPayment.amount) !== Number(record.amount_paise) || rpPayment.currency !== 'INR' || !['authorized','captured'].includes(rpPayment.status)) {
+    if (rpPayment.order_id !== orderId || Number(rpPayment.amount) !== Number(record.amount_paise) || rpPayment.currency !== 'INR' || rpPayment.status !== 'captured') {
       return res.status(400).json({ error: 'Razorpay payment details do not match this order or payment is not authorized.' });
     }
     // Atomic update prevents two concurrent callbacks from activating different payments for the same order.
@@ -156,20 +165,33 @@ app.post('/api/verify-payment', async (req, res) => {
     );
     if (updated.modifiedCount === 0) {
       const latest = await orders.findOne({ order_id: orderId });
-      if (latest?.status === 'paid' && latest.payment_id === paymentId) return res.json({ ok: true, status: 'paid', orderId });
-      return res.status(409).json({ error: 'This order was already paid with a different payment. Contact support.' });
+      if (!(latest?.status === 'paid' && latest.payment_id === paymentId)) return res.status(409).json({ error: 'This order was already paid with a different payment. Contact support.' });
     }
-    res.json({ ok: true, status: 'paid', orderId });
+    // Create exactly one profile from the fields attached to this user's paid order.
+    // source_order_id uniqueness makes retries safe and prevents duplicate profiles.
+    let profile = await profiles.findOne({ source_order_id: orderId, user_id: record.user_id });
+    if (!profile) {
+      const profileDoc = { user_id: record.user_id, source_order_id: orderId, name: record.profile_name, fields: record.profile_fields || {}, created_at: new Date(), updated_at: new Date() };
+      try {
+        const inserted = await profiles.insertOne(profileDoc);
+        profile = { ...profileDoc, _id: inserted.insertedId };
+      } catch (insertError) {
+        if (insertError.code !== 11000) throw insertError;
+        profile = await profiles.findOne({ source_order_id: orderId, user_id: record.user_id });
+      }
+    }
+    await orders.updateOne({ order_id: orderId, user_id: record.user_id }, { $set: { profile_id: profile?._id?.toString() || null } });
+    res.json({ ok: true, status: 'paid', orderId, profile: profile ? { id: profile._id.toString(), name: profile.name } : undefined });
   } catch (e) {
     console.error('verify-payment failed:', e.message);
     res.status(500).json({ error: 'Payment verification could not complete. Do not pay again; retry verification or contact support.' });
   }
 });
-app.get('/api/payment-status/:orderId', async (req, res) => {
+app.get('/api/payment-status/:orderId', authRequired, async (req, res) => {
   try {
-    const record = await orders.findOne({ order_id: String(req.params.orderId) }, { projection: { order_id: 1, status: 1 } });
+    const record = await orders.findOne({ order_id: String(req.params.orderId), user_id: req.auth.sub }, { projection: { order_id: 1, status: 1, profile_id: 1 } });
     if (!record) return res.status(404).json({ status: 'unknown', error: 'Order not found in persistent database.' });
-    res.json({ orderId: record.order_id, status: record.status });
+    res.json({ orderId: record.order_id, status: record.status, profileId: record.profile_id || null });
   } catch (e) { console.error('payment-status failed:', e.message); res.status(500).json({ error: 'Could not check payment status.' }); }
 });
 (async () => {
