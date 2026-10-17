@@ -1,16 +1,23 @@
 {
-  "name": "multi-dataset-payment-backend",
-  "version": "1.2.0",
+  "name": "autofill-mult-user-backend",
+  "version": "2.0.0",
   "private": true,
-  "description": "Razorpay test-mode backend with persistent MongoDB order storage",
+  "description": "Multi-user auth and profile API scaffold with MongoDB and existing Razorpay checkout",
   "main": "server.js",
-  "scripts": { "start": "node server.js", "dev": "node --watch server.js" },
-  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "mongodb": "^6.12.0",
-    "razorpay": "^2.9.6"
+    "razorpay": "^2.9.6",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
   }
 }

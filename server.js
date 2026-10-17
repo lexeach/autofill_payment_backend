@@ -3,7 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
@@ -18,6 +20,8 @@ const PRICE_PAISE = 200000;
 if (!process.env.MONGODB_URI) console.warn('WARNING: MONGODB_URI is missing. Persistent payment storage is required.');
 const mongoClient = new MongoClient(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017', { serverSelectionTimeoutMS: 10000 });
 let orders;
+let users;
+let profiles;
 let razorpay;
 function gateway() {
   if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_KEY_ID.includes('replace_me')) throw new Error('Set Razorpay TEST credentials in Render Environment Variables.');
@@ -28,10 +32,79 @@ async function initDb() {
   await mongoClient.connect();
   const db = mongoClient.db(process.env.MONGODB_DB || 'autofill_payments');
   orders = db.collection('profile_payment_orders');
+  users = db.collection('users');
+  profiles = db.collection('profiles');
+  await users.createIndex({ email: 1 }, { unique: true });
+  await profiles.createIndex({ user_id: 1, created_at: -1 });
   await orders.createIndex({ order_id: 1 }, { unique: true });
   await orders.createIndex({ payment_id: 1 }, { unique: true, sparse: true });
   await orders.createIndex({ status: 1, created_at: -1 });
 }
+function authRequired(req, res, next) {
+  try {
+    const header = String(req.headers.authorization || '');
+    if (!header.startsWith('Bearer ')) return res.status(401).json({ error: 'Please login.' });
+    const secret = process.env.JWT_SECRET;
+    if (!secret || secret.length < 32) return res.status(503).json({ error: 'Server authentication is not configured. Set JWT_SECRET (32+ characters).' });
+    req.auth = jwt.verify(header.slice(7), secret);
+    next();
+  } catch (_e) { return res.status(401).json({ error: 'Session expired or invalid. Please login again.' }); }
+}
+function cleanEmail(value) { return String(value || '').trim().toLowerCase().slice(0, 254); }
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const email = cleanEmail(req.body?.email), password = String(req.body?.password || '');
+    if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
+    if (password.length < 10 || password.length > 128) return res.status(400).json({ error: 'Password must be 10–128 characters.' });
+    const password_hash = await bcrypt.hash(password, 12);
+    const user = { email, password_hash, created_at: new Date(), active: true };
+    const result = await users.insertOne(user);
+    const token = jwt.sign({ sub: result.insertedId.toString(), email }, process.env.JWT_SECRET, { expiresIn: '12h', issuer: 'autofill-backend', audience: 'autofill-client' });
+    res.status(201).json({ token, user: { id: result.insertedId.toString(), email } });
+  } catch (e) { if (e.code === 11000) return res.status(409).json({ error: 'An account with this email already exists.' }); console.error('register failed:', e.message); res.status(500).json({ error: 'Registration failed.' }); }
+});
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const email = cleanEmail(req.body?.email), password = String(req.body?.password || '');
+    const user = await users.findOne({ email, active: true });
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Invalid email or password.' });
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) return res.status(503).json({ error: 'Server authentication is not configured. Contact administrator.' });
+    const token = jwt.sign({ sub: user._id.toString(), email }, process.env.JWT_SECRET, { expiresIn: '12h', issuer: 'autofill-backend', audience: 'autofill-client' });
+    res.json({ token, user: { id: user._id.toString(), email } });
+  } catch (e) { console.error('login failed:', e.message); res.status(500).json({ error: 'Login failed.' }); }
+});
+app.get('/api/auth/me', authRequired, async (req, res) => { res.json({ user: { id: req.auth.sub, email: req.auth.email } }); });
+app.get('/api/profiles', authRequired, async (req, res) => {
+  try { const rows = await profiles.find({ user_id: req.auth.sub }).sort({ created_at: -1 }).project({ user_id: 0 }).toArray(); res.json({ profiles: rows.map(x => ({ ...x, id: x._id.toString(), _id: undefined })) }); }
+  catch (e) { console.error('list profiles failed:', e.message); res.status(500).json({ error: 'Could not load profiles.' }); }
+});
+app.post('/api/profiles', authRequired, async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim().slice(0, 80);
+    const fields = req.body?.fields;
+    if (!name) return res.status(400).json({ error: 'Profile name is required.' });
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return res.status(400).json({ error: 'Profile fields must be an object.' });
+    if (JSON.stringify(fields).length > 20000) return res.status(413).json({ error: 'Profile data is too large.' });
+    const count = await profiles.countDocuments({ user_id: req.auth.sub });
+    if (count >= 100) return res.status(403).json({ error: 'Profile limit reached. Contact support.' });
+    const doc = { user_id: req.auth.sub, name, fields, created_at: new Date(), updated_at: new Date() };
+    const result = await profiles.insertOne(doc); res.status(201).json({ profile: { id: result.insertedId.toString(), name, fields, created_at: doc.created_at } });
+  } catch (e) { console.error('create profile failed:', e.message); res.status(500).json({ error: 'Could not save profile.' }); }
+});
+app.put('/api/profiles/:id', authRequired, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Invalid profile ID.' });
+    const name = String(req.body?.name || '').trim().slice(0, 80), fields = req.body?.fields;
+    if (!name || !fields || typeof fields !== 'object' || Array.isArray(fields) || JSON.stringify(fields).length > 20000) return res.status(400).json({ error: 'Valid profile name and fields are required.' });
+    const result = await profiles.findOneAndUpdate({ _id: new ObjectId(req.params.id), user_id: req.auth.sub }, { $set: { name, fields, updated_at: new Date() } }, { returnDocument: 'after', projection: { user_id: 0 } });
+    if (!result) return res.status(404).json({ error: 'Profile not found.' }); const x = result; res.json({ profile: { id: x._id.toString(), name: x.name, fields: x.fields, updated_at: x.updated_at } });
+  } catch (e) { console.error('update profile failed:', e.message); res.status(500).json({ error: 'Could not update profile.' }); }
+});
+app.delete('/api/profiles/:id', authRequired, async (req, res) => {
+  try { if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Invalid profile ID.' }); const r = await profiles.deleteOne({ _id: new ObjectId(req.params.id), user_id: req.auth.sub }); if (!r.deletedCount) return res.status(404).json({ error: 'Profile not found.' }); res.json({ ok: true }); }
+  catch (e) { console.error('delete profile failed:', e.message); res.status(500).json({ error: 'Could not delete profile.' }); }
+});
+
 app.get('/health', async (_req, res) => {
   try { await orders.findOne({}, { projection: { _id: 1 } }); res.json({ ok: true, database: 'connected', databaseType: 'MongoDB', mode: 'test-setup', pricePaise: PRICE_PAISE }); }
   catch (_e) { res.status(503).json({ ok: false, database: 'disconnected', databaseType: 'MongoDB' }); }
