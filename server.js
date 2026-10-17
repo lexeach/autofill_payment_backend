@@ -51,7 +51,86 @@ function authRequired(req, res, next) {
     next();
   } catch (_e) { return res.status(401).json({ error: 'Session expired or invalid. Please login again.' }); }
 }
+
+function adminRequired(req, res, next) {
+  try {
+    const header = String(req.headers.authorization || '');
+    if (!header.startsWith('Bearer ')) return res.status(401).json({ error: 'Admin login required.' });
+    const secret = process.env.JWT_SECRET;
+    if (!secret || secret.length < 32) return res.status(503).json({ error: 'Server authentication is not configured.' });
+    const payload = jwt.verify(header.slice(7), secret, { issuer: 'autofill-backend', audience: 'autofill-admin' });
+    if (payload.role !== 'admin' || payload.sub !== 'admin') return res.status(403).json({ error: 'Administrator access required.' });
+    req.admin = payload;
+    next();
+  } catch (_e) { return res.status(401).json({ error: 'Admin session expired or invalid. Please login again.' }); }
+}
+
 function cleanEmail(value) { return String(value || '').trim().toLowerCase().slice(0, 254); }
+
+// Admin login uses credentials stored only in Render environment variables.
+// Configure ADMIN_EMAIL and ADMIN_PASSWORD before using /admin.html.
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const email = cleanEmail(req.body?.email);
+    const password = String(req.body?.password || '');
+    const expectedEmail = cleanEmail(process.env.ADMIN_EMAIL);
+    const expectedPassword = String(process.env.ADMIN_PASSWORD || '');
+    if (!expectedEmail || expectedPassword.length < 14) {
+      return res.status(503).json({ error: 'Admin login is not configured. Set ADMIN_EMAIL and ADMIN_PASSWORD (at least 14 characters) in Render.' });
+    }
+    const emailOk = email === expectedEmail;
+    const supplied = Buffer.from(password);
+    const expected = Buffer.from(expectedPassword);
+    const passwordOk = supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+    if (!emailOk || !passwordOk) return res.status(401).json({ error: 'Invalid admin email or password.' });
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) return res.status(503).json({ error: 'Server authentication is not configured.' });
+    const token = jwt.sign({ sub: 'admin', email: expectedEmail, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '4h', issuer: 'autofill-backend', audience: 'autofill-admin' });
+    return res.json({ token, admin: { email: expectedEmail } });
+  } catch (e) {
+    console.error('admin login failed:', e.message);
+    return res.status(500).json({ error: 'Admin login failed.' });
+  }
+});
+app.get('/api/admin/stats', adminRequired, async (_req, res) => {
+  try {
+    const [userCount, profileCount, orderCount, paidCount, paidAmount] = await Promise.all([
+      users.countDocuments({}),
+      profiles.countDocuments({}),
+      orders.countDocuments({}),
+      orders.countDocuments({ status: 'paid' }),
+      orders.aggregate([{ $match: { status: 'paid' } }, { $group: { _id: null, total: { $sum: '$amount_paise' } } }]).toArray()
+    ]);
+    res.json({ users: userCount, profiles: profileCount, orders: orderCount, paidOrders: paidCount, paidAmountPaise: paidAmount[0]?.total || 0 });
+  } catch (e) { console.error('admin stats failed:', e.message); res.status(500).json({ error: 'Could not load admin statistics.' }); }
+});
+app.get('/api/admin/users', adminRequired, async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+    const rows = await users.find({}).sort({ created_at: -1 }).limit(limit).project({ password_hash: 0 }).toArray();
+    res.json({ users: rows.map(x => ({ id: x._id.toString(), email: x.email, active: x.active !== false, created_at: x.created_at, profile_count: 0 })) });
+  } catch (e) { console.error('admin users failed:', e.message); res.status(500).json({ error: 'Could not load users.' }); }
+});
+app.get('/api/admin/profiles', adminRequired, async (req, res) => {
+  try {
+    const limit = Math.min(300, Math.max(1, Number(req.query.limit) || 100));
+    const rows = await profiles.find({}).sort({ created_at: -1 }).limit(limit).project({ fields: 0 }).toArray();
+    const userIds = [...new Set(rows.map(x => x.user_id).filter(Boolean))];
+    const userDocs = userIds.length ? await users.find({ _id: { $in: userIds.filter(ObjectId.isValid).map(x => new ObjectId(x)) } }).project({ email: 1 }).toArray() : [];
+    const emails = new Map(userDocs.map(x => [x._id.toString(), x.email]));
+    res.json({ profiles: rows.map(x => ({ id: x._id.toString(), user_id: x.user_id, user_email: emails.get(x.user_id) || 'Unknown user', name: x.name, created_at: x.created_at, updated_at: x.updated_at, field_count: Object.keys(x.fields || {}).length, paid_order: Boolean(x.source_order_id) })) });
+  } catch (e) { console.error('admin profiles failed:', e.message); res.status(500).json({ error: 'Could not load profiles.' }); }
+});
+app.get('/api/admin/orders', adminRequired, async (req, res) => {
+  try {
+    const limit = Math.min(300, Math.max(1, Number(req.query.limit) || 100));
+    const rows = await orders.find({}).sort({ created_at: -1 }).limit(limit).project({ profile_fields: 0 }).toArray();
+    const userIds = [...new Set(rows.map(x => x.user_id).filter(Boolean))];
+    const userDocs = userIds.length ? await users.find({ _id: { $in: userIds.filter(ObjectId.isValid).map(x => new ObjectId(x)) } }).project({ email: 1 }).toArray() : [];
+    const emails = new Map(userDocs.map(x => [x._id.toString(), x.email]));
+    res.json({ orders: rows.map(x => ({ order_id: x.order_id, user_email: emails.get(x.user_id) || 'Unknown user', profile_name: x.profile_name, amount_paise: x.amount_paise, currency: x.currency, status: x.status, created_at: x.created_at, paid_at: x.paid_at, payment_id: x.payment_id || null })) });
+  } catch (e) { console.error('admin orders failed:', e.message); res.status(500).json({ error: 'Could not load payment orders.' }); }
+});
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     const email = cleanEmail(req.body?.email), password = String(req.body?.password || '');
