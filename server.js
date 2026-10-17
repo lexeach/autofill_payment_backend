@@ -117,8 +117,18 @@ app.get('/api/admin/profiles', adminRequired, async (req, res) => {
     const userIds = [...new Set(rows.map(x => x.user_id).filter(Boolean))];
     const userDocs = userIds.length ? await users.find({ _id: { $in: userIds.filter(ObjectId.isValid).map(x => new ObjectId(x)) } }).project({ email: 1 }).toArray() : [];
     const emails = new Map(userDocs.map(x => [x._id.toString(), x.email]));
-    res.json({ profiles: rows.map(x => ({ id: x._id.toString(), user_id: x.user_id, user_email: emails.get(x.user_id) || 'Unknown user', name: x.name, created_at: x.created_at, updated_at: x.updated_at, field_count: Object.keys(x.fields || {}).length, paid_order: Boolean(x.source_order_id) })) });
+    res.json({ profiles: rows.map(x => ({ id: x._id.toString(), user_id: x.user_id, user_email: emails.get(x.user_id) || 'Unknown user', name: x.name, created_at: x.created_at, updated_at: x.updated_at, field_count: Object.keys(x.fields || {}).length, paid_order: Boolean(x.source_order_id), is_active: x.is_active === true || Boolean(x.source_order_id), activation_method: x.activation_method || (x.source_order_id ? 'payment' : null), activated_at: x.activated_at || null })) });
   } catch (e) { console.error('admin profiles failed:', e.message); res.status(500).json({ error: 'Could not load profiles.' }); }
+});
+app.post('/api/admin/profiles/:id/activate', adminRequired, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Invalid profile ID.' });
+    const profile = await profiles.findOne({ _id: new ObjectId(req.params.id) }, { projection: { _id: 1, is_active: 1, source_order_id: 1, activation_method: 1 } });
+    if (!profile) return res.status(404).json({ error: 'Profile not found.' });
+    const now = new Date();
+    await profiles.updateOne({ _id: profile._id }, { $set: { is_active: true, activation_method: 'admin', activated_at: now, manually_activated_by: req.admin.email, updated_at: now } });
+    res.json({ ok: true, profileId: profile._id.toString(), is_active: true, activation_method: 'admin', activated_at: now });
+  } catch (e) { console.error('admin profile activation failed:', e.message); res.status(500).json({ error: 'Could not manually activate profile.' }); }
 });
 app.get('/api/admin/orders', adminRequired, async (req, res) => {
   try {
@@ -155,12 +165,16 @@ app.post('/api/auth/login', async (req, res) => {
 });
 app.get('/api/auth/me', authRequired, async (req, res) => { res.json({ user: { id: req.auth.sub, email: req.auth.email } }); });
 app.get('/api/profiles', authRequired, async (req, res) => {
-  try { const rows = await profiles.find({ user_id: req.auth.sub }).sort({ created_at: -1 }).project({ user_id: 0 }).toArray(); res.json({ profiles: rows.map(x => ({ ...x, id: x._id.toString(), _id: undefined })) }); }
-  catch (e) { console.error('list profiles failed:', e.message); res.status(500).json({ error: 'Could not load profiles.' }); }
+  try {
+    const rows = await profiles.find({ user_id: req.auth.sub }).sort({ created_at: -1 }).project({ user_id: 0 }).toArray();
+    res.json({ profiles: rows.map(x => ({
+      ...x, id: x._id.toString(), _id: undefined,
+      is_active: x.is_active === true || Boolean(x.source_order_id),
+      activation_method: x.activation_method || (x.source_order_id ? 'payment' : null)
+    })) });
+  } catch (e) { console.error('list profiles failed:', e.message); res.status(500).json({ error: 'Could not load profiles.' }); }
 });
 app.post('/api/profiles', authRequired, async (req, res) => {
-  // New profiles must be created only by the verified-payment flow below.
-  return res.status(402).json({ error: 'Payment required. Start checkout to create a new profile.', code: 'PAYMENT_REQUIRED' });
   try {
     const name = String(req.body?.name || '').trim().slice(0, 80);
     const fields = req.body?.fields;
@@ -169,8 +183,10 @@ app.post('/api/profiles', authRequired, async (req, res) => {
     if (JSON.stringify(fields).length > 20000) return res.status(413).json({ error: 'Profile data is too large.' });
     const count = await profiles.countDocuments({ user_id: req.auth.sub });
     if (count >= 100) return res.status(403).json({ error: 'Profile limit reached. Contact support.' });
-    const doc = { user_id: req.auth.sub, name, fields, created_at: new Date(), updated_at: new Date() };
-    const result = await profiles.insertOne(doc); res.status(201).json({ profile: { id: result.insertedId.toString(), name, fields, created_at: doc.created_at } });
+    const now = new Date();
+    const doc = { user_id: req.auth.sub, name, fields, is_active: false, activation_method: null, activated_at: null, created_at: now, updated_at: now };
+    const result = await profiles.insertOne(doc);
+    res.status(201).json({ profile: { id: result.insertedId.toString(), name, fields, is_active: false, activation_method: null, activated_at: null, created_at: now, updated_at: now } });
   } catch (e) { console.error('create profile failed:', e.message); res.status(500).json({ error: 'Could not save profile.' }); }
 });
 app.put('/api/profiles/:id', authRequired, async (req, res) => {
@@ -193,21 +209,28 @@ app.get('/health', async (_req, res) => {
 });
 app.post('/api/create-order', authRequired, async (req, res) => {
   try {
-    const name = String(req.body?.profileName || req.body?.name || '').trim().slice(0, 80);
-    const fields = req.body?.fields;
+    const profileId = String(req.body?.profileId || '');
     const amount = Number(req.body?.amount);
-    if (!name) return res.status(400).json({ error: 'Profile name is required.' });
-    if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return res.status(400).json({ error: 'Profile fields are required.' });
-    if (JSON.stringify(fields).length > 20000) return res.status(413).json({ error: 'Profile data is too large.' });
-    if (amount !== PRICE_PAISE) return res.status(400).json({ error: 'Profile price must be ₹2,000.' });
-    const count = await profiles.countDocuments({ user_id: req.auth.sub });
-    if (count >= 100) return res.status(403).json({ error: 'Profile limit reached. Contact support.' });
+    if (!ObjectId.isValid(profileId)) return res.status(400).json({ error: 'A valid saved profile is required for activation.' });
+    if (amount !== PRICE_PAISE) return res.status(400).json({ error: 'Profile activation fee must be ₹2,000.' });
+    const profile = await profiles.findOne({ _id: new ObjectId(profileId), user_id: req.auth.sub });
+    if (!profile) return res.status(404).json({ error: 'Profile not found in your account.' });
+    const active = profile.is_active === true || Boolean(profile.source_order_id);
+    if (active) return res.status(409).json({ error: 'This profile is already activated.' });
     const rp = gateway();
-    const order = await rp.orders.create({ amount: PRICE_PAISE, currency: 'INR', receipt: `profile_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`, notes: { purpose: 'new-profile', profileName: name, userId: req.auth.sub } });
-    await orders.insertOne({ order_id: order.id, user_id: req.auth.sub, profile_name: name, profile_fields: fields, amount_paise: PRICE_PAISE, currency: 'INR', status: 'created', created_at: new Date(), paid_at: null, profile_id: null });
-    const checkoutUrl = `/checkout/${encodeURIComponent(order.id)}`;
-    res.json({ orderId: order.id, checkoutUrl: `${PUBLIC_BASE_URL}${checkoutUrl}`, keyId: process.env.RAZORPAY_KEY_ID });
-  } catch (e) { console.error('create-order failed:', e.message); res.status(500).json({ error: 'Could not create payment order. Check backend logs and configuration.' }); }
+    const order = await rp.orders.create({
+      amount: PRICE_PAISE, currency: 'INR',
+      receipt: `activate_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+      notes: { purpose: 'profile-activation', profileId: profile._id.toString(), userId: req.auth.sub, profileName: profile.name }
+    });
+    await orders.insertOne({
+      order_id: order.id, user_id: req.auth.sub, profile_id: profile._id.toString(),
+      profile_name: profile.name, amount_paise: PRICE_PAISE, currency: 'INR',
+      status: 'created', created_at: new Date(), paid_at: null, payment_id: null,
+      activation_type: 'profile-activation'
+    });
+    res.json({ orderId: order.id, checkoutUrl: `${PUBLIC_BASE_URL}/checkout/${encodeURIComponent(order.id)}`, keyId: process.env.RAZORPAY_KEY_ID });
+  } catch (e) { console.error('create-order failed:', e.message); res.status(500).json({ error: 'Could not create activation payment order. Check backend logs and configuration.' }); }
 });
 app.get('/checkout/:orderId', async (req, res) => {
   try {
@@ -227,40 +250,31 @@ app.post('/api/verify-payment', async (req, res) => {
     if (!order_id || !payment_id || !signature) return res.status(400).json({ error: 'Missing payment verification fields.' });
     const orderId = String(order_id), paymentId = String(payment_id), sig = String(signature);
     const record = await orders.findOne({ order_id: orderId });
-    if (!record) return res.status(404).json({ error: 'Order not found. Please contact support before paying again.' });
-    if (!record.user_id || !record.profile_name || !record.profile_fields) return res.status(409).json({ error: 'This legacy order is not linked to a profile account. Contact support before retrying.' });
+    if (!record) return res.status(404).json({ error: 'Order not found.' });
+    if (!record.user_id || !record.profile_id) return res.status(409).json({ error: 'This order is not linked to a saved profile. Contact support.' });
     if (record.status === 'paid' && record.payment_id !== paymentId) return res.status(409).json({ error: 'This order was already paid with a different payment. Contact support.' });
     const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
     const a = Buffer.from(sig), b = Buffer.from(expected);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(400).json({ error: 'Payment signature verification failed.' });
     const rpPayment = await gateway().payments.fetch(paymentId);
     if (rpPayment.order_id !== orderId || Number(rpPayment.amount) !== Number(record.amount_paise) || rpPayment.currency !== 'INR' || rpPayment.status !== 'captured') {
-      return res.status(400).json({ error: 'Razorpay payment details do not match this order or payment is not authorized.' });
+      return res.status(400).json({ error: 'Razorpay payment details do not match this order or payment is not captured.' });
     }
-    // Atomic update prevents two concurrent callbacks from activating different payments for the same order.
     const updated = await orders.updateOne(
-      { order_id: orderId, status: { $ne: 'paid' } },
+      { order_id: orderId, user_id: record.user_id, status: { $ne: 'paid' } },
       { $set: { status: 'paid', payment_id: paymentId, paid_at: new Date() } }
     );
     if (updated.modifiedCount === 0) {
       const latest = await orders.findOne({ order_id: orderId });
       if (!(latest?.status === 'paid' && latest.payment_id === paymentId)) return res.status(409).json({ error: 'This order was already paid with a different payment. Contact support.' });
     }
-    // Create exactly one profile from the fields attached to this user's paid order.
-    // source_order_id uniqueness makes retries safe and prevents duplicate profiles.
-    let profile = await profiles.findOne({ source_order_id: orderId, user_id: record.user_id });
-    if (!profile) {
-      const profileDoc = { user_id: record.user_id, source_order_id: orderId, name: record.profile_name, fields: record.profile_fields || {}, created_at: new Date(), updated_at: new Date() };
-      try {
-        const inserted = await profiles.insertOne(profileDoc);
-        profile = { ...profileDoc, _id: inserted.insertedId };
-      } catch (insertError) {
-        if (insertError.code !== 11000) throw insertError;
-        profile = await profiles.findOne({ source_order_id: orderId, user_id: record.user_id });
-      }
-    }
-    await orders.updateOne({ order_id: orderId, user_id: record.user_id }, { $set: { profile_id: profile?._id?.toString() || null } });
-    res.json({ ok: true, status: 'paid', orderId, profile: profile ? { id: profile._id.toString(), name: profile.name } : undefined });
+    if (!ObjectId.isValid(record.profile_id)) return res.status(409).json({ error: 'Invalid linked profile. Contact support.' });
+    const activation = await profiles.updateOne(
+      { _id: new ObjectId(record.profile_id), user_id: record.user_id },
+      { $set: { is_active: true, activation_method: 'payment', activated_at: new Date(), activation_order_id: orderId, updated_at: new Date() } }
+    );
+    if (activation.matchedCount === 0) return res.status(404).json({ error: 'Payment was verified, but the linked profile could not be found. Contact support with the order ID.' });
+    res.json({ ok: true, status: 'paid', orderId, profileId: record.profile_id, is_active: true });
   } catch (e) {
     console.error('verify-payment failed:', e.message);
     res.status(500).json({ error: 'Payment verification could not complete. Do not pay again; retry verification or contact support.' });
@@ -270,7 +284,8 @@ app.get('/api/payment-status/:orderId', authRequired, async (req, res) => {
   try {
     const record = await orders.findOne({ order_id: String(req.params.orderId), user_id: req.auth.sub }, { projection: { order_id: 1, status: 1, profile_id: 1 } });
     if (!record) return res.status(404).json({ status: 'unknown', error: 'Order not found in persistent database.' });
-    res.json({ orderId: record.order_id, status: record.status, profileId: record.profile_id || null });
+    const profile = record.profile_id && ObjectId.isValid(record.profile_id) ? await profiles.findOne({ _id: new ObjectId(record.profile_id), user_id: req.auth.sub }, { projection: { is_active: 1, source_order_id: 1 } }) : null;
+    res.json({ orderId: record.order_id, status: record.status, profileId: record.profile_id || null, is_active: profile ? (profile.is_active === true || Boolean(profile.source_order_id)) : false });
   } catch (e) { console.error('payment-status failed:', e.message); res.status(500).json({ error: 'Could not check payment status.' }); }
 });
 (async () => {
