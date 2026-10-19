@@ -9,7 +9,10 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
-const allowed = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const codeAllowedOrigins = require('./config/corsOrigins');
+// Optional: environment origins are still supported and merged with the code allowlist.
+const envAllowedOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const allowed = [...new Set([...codeAllowedOrigins, ...envAllowedOrigins])];
 app.use(cors({ origin(origin, cb) {
   if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
   return cb(new Error('Origin not allowed by CORS'));
